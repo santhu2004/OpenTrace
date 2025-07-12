@@ -1,0 +1,2 @@
+# Minimal requirements for the hybrid Go/Python crawler
+# Only basic Python modules are needed for subprocess and JSON handling
