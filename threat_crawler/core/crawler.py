@@ -147,7 +147,7 @@ async def crawl_site(seed_url):
         for page in pages:
             if page['status_code'] != 200:
                 print(f"[!] Skipping failed page: {page['url']} (status: {page['status_code']})")
-            continue
+                continue
 
             # For now, we'll use the data from Go crawler
             # In a full implementation, you might want to re-fetch with Python
