@@ -3,9 +3,15 @@ package main
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+var (
+	pagesCrawled int32
+	queueSize    int32
 )
 
 // Crawler manages the crawling process with concurrency and depth control
@@ -249,4 +255,128 @@ func (c *Crawler) GetVisitedCount() int {
 	c.visitedMux.RLock()
 	defer c.visitedMux.RUnlock()
 	return len(c.visited)
+}
+
+// CrawlStream performs the crawl and streams each result to the provided channel as soon as it's available.
+func (c *Crawler) CrawlStream(ctx context.Context, out chan<- *CrawlResult) {
+	type QueueItem struct {
+		URL    string
+		Depth  int
+		Parent string
+	}
+
+	visited := make(map[string]struct{})
+	var visitedMux sync.RWMutex
+	queue := make(chan QueueItem, c.config.MaxLinks*2)
+	var wg sync.WaitGroup       // For worker goroutines
+	var inFlight sync.WaitGroup // For in-flight work
+	var closeOnce sync.Once     // Guard for closing out
+
+	normalize := func(url string) string {
+		return strings.TrimRight(url, "/")
+	}
+
+	// Worker function (with debug logs and defer for inFlight.Done)
+	worker := func(id int) {
+		defer func() {
+			log.Printf("[WORKER %d] Exiting", id)
+			wg.Done()
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("[WORKER %d] Context cancelled, exiting", id)
+				return
+			case item, ok := <-queue:
+				if !ok {
+					log.Printf("[WORKER %d] Queue closed, exiting", id)
+					return
+				}
+				func() {
+					defer inFlight.Done() // Always call Done for this item
+
+					log.Printf("[WORKER %d] Processing: %s (depth: %d)", id, item.URL, item.Depth)
+
+					if item.Depth > c.config.MaxDepth {
+						return
+					}
+
+					visitedMux.RLock()
+					_, seen := visited[normalize(item.URL)]
+					visitedMux.RUnlock()
+					if seen {
+						return
+					}
+
+					visitedMux.Lock()
+					visited[normalize(item.URL)] = struct{}{}
+					visitedMux.Unlock()
+
+					// Fetch the page using the fetcher
+					result, _ := c.fetcher.FetchPage(ctx, item.URL)
+					if result != nil {
+						result.Depth = item.Depth
+						if result.Headers == nil {
+							result.Headers = map[string]string{}
+						}
+						result.Headers["Parent-URL"] = item.Parent
+						out <- result
+						// Enqueue discovered links
+						if item.Depth < c.config.MaxDepth {
+							for _, link := range result.Links {
+								visitedMux.RLock()
+								_, already := visited[normalize(link)]
+								visitedMux.RUnlock()
+								if !already {
+									log.Printf("[WORKER %d] Enqueueing: %s (depth: %d)", id, link, item.Depth+1)
+									inFlight.Add(1)
+									queue <- QueueItem{URL: link, Depth: item.Depth + 1, Parent: item.URL}
+								}
+							}
+						}
+					}
+				}()
+			}
+		}
+	}
+
+	// Seed the crawl
+	inFlight.Add(1)
+	queue <- QueueItem{URL: c.config.TargetURL, Depth: 0, Parent: ""}
+
+	// Start workers
+	for i := 0; i < c.config.MaxConcurrency; i++ {
+		wg.Add(1)
+		go worker(i)
+	}
+
+	// Monitor in-flight work and close queue/results when done
+	go func() {
+		log.Println("[MONITOR] Waiting for inFlight to finish...")
+		done := make(chan struct{})
+		go func() {
+			inFlight.Wait()
+			log.Println("[MONITOR] inFlight done, closing queue...")
+			close(queue)
+			log.Println("[MONITOR] Waiting for all workers to exit...")
+			wg.Wait()
+			log.Println("[MONITOR] All workers exited, closing output channel...")
+			closeOnce.Do(func() { close(out) })
+			log.Println("[MONITOR] Output channel closed. CrawlStream done.")
+			close(done)
+		}()
+		select {
+		case <-done:
+			// Normal exit
+		case <-ctx.Done():
+			log.Println("[MONITOR] Context cancelled, waiting up to 10s for shutdown...")
+			select {
+			case <-done:
+				// Shutdown completed in time
+			case <-time.After(10 * time.Second):
+				log.Println("[MONITOR] Timeout waiting for shutdown. Forcing output channel close!")
+				closeOnce.Do(func() { close(out) })
+			}
+		}
+	}()
 }

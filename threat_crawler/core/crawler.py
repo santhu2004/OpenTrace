@@ -5,89 +5,132 @@ import json
 import subprocess
 import tempfile
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Any
 from storage.writer import save_result
 from config.settings import CRAWL_DEPTH_LIMIT, MAX_PAGES_PER_DOMAIN
 
-def run_go_crawler(target_url: str, max_depth: int = 2, max_links: int = 50) -> Dict[str, Any]:
+
+def run_go_crawler(config: dict) -> List[Dict[str, Any]]:
     """
-    Run the Go fastcrawl binary as a subprocess and return structured results.
-    
+    Runs the Go-based fastcrawl.exe with the given config, captures its JSON output, and returns the results.
+    Uses subprocess.Popen to read output line by line and avoid deadlocks.
     Args:
-        target_url: URL to crawl
-        max_depth: Maximum crawl depth
-        max_links: Maximum number of pages to crawl
-        
+        config: Dictionary with keys: start_url, max_depth, max_pages, timeout, user_agent, workers
     Returns:
-        Dictionary containing crawl results and summary
+        List of parsed JSON results from the Go crawler
+    Raises:
+        RuntimeError if the Go binary fails or output is invalid
     """
-    # Path to the Go binary
-    go_binary_path = Path(__file__).parent.parent / "go_crawler" / "fastcrawl.exe"
-    
-    if not go_binary_path.exists():
-        raise FileNotFoundError(f"Go crawler binary not found: {go_binary_path}")
-    
-    # Prepare configuration for Go crawler
-    config = {
-        "target_url": target_url,
-        "max_depth": max_depth,
-        "max_links": max_links,
-        "timeout": "30s",
-        "max_concurrency": 10,
-        "user_agent": "ThreatCrawler/1.0",
-        "respect_robots": False
-    }
-    
+    import time
+    import threading
+    import queue
+    import os
+    import json
+
+    go_bin = os.path.join(os.path.dirname(__file__), '../go_crawler/fastcrawl.exe')
+    if not os.path.exists(go_bin):
+        go_bin = os.path.join(os.path.dirname(__file__), '../go_crawler/fastcrawl')
+        if not os.path.exists(go_bin):
+            raise FileNotFoundError(f"Go crawler binary not found at {go_bin}")
+
+    go_dir = os.path.dirname(go_bin)
+
+    required = ['start_url', 'max_depth', 'max_pages', 'timeout', 'user_agent', 'workers']
+    for key in required:
+        if key not in config or config[key] in (None, ""):
+            raise ValueError(f"Missing required config: {key}")
+
+    command = [
+        go_bin,
+        f"-start_url={config['start_url']}",
+        f"-max_depth={int(config['max_depth'])}",
+        f"-max_pages={int(config['max_pages'])}",
+        f"-timeout={str(config['timeout'])}",
+        f"-user_agent={str(config['user_agent'])}",
+        f"-workers={int(config['workers'])}",
+    ]
+    print(f"[DEBUG] Running Go crawler command: {' '.join(command)}")
+    print(f"[DEBUG] Working directory for Go: {go_dir}")
+
+    results = []
+    start_time = time.time()
     try:
-        # Create temporary input file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_input:
-            json.dump(config, temp_input)
-            temp_input_path = temp_input.name
-        
-        # Prepare command
-        cmd = [str(go_binary_path), "-input", temp_input_path]
-        
-        # Execute Go crawler
-        print(f"[+] Running Go crawler for: {target_url}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=300  # 5 minute timeout
+            bufsize=1,
+            cwd=go_dir,
         )
-        
-        # Handle errors
-        if result.returncode != 0:
-            print(f"[!] Go crawler failed with exit code {result.returncode}")
-            print(f"[!] Error output: {result.stderr}")
-            raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-        
-        # Parse JSON output
-        output_data = json.loads(result.stdout)
-        
-        # Validate output structure
-        required_keys = ['config', 'results', 'summary', 'timestamp']
-        for key in required_keys:
-            if key not in output_data:
-                raise ValueError(f"Missing required key in Go crawler output: {key}")
-        
-        print(f"[✓] Go crawler completed successfully")
-        print(f"[*] Crawled {output_data['summary']['total_pages']} pages")
-        print(f"[*] Duration: {output_data['summary']['duration']}")
-        
-        return output_data
-        
-    except json.JSONDecodeError as e:
-        print(f"[!] Failed to parse Go crawler output: {e}")
+        print(f"[DEBUG] Go crawler PID: {proc.pid}")
+
+        # Print Go stderr in a background thread
+        def stderr_reader():
+            for line in proc.stderr:
+                print(f"[GO-STDERR] {line.rstrip()}")
+        stderr_thread = threading.Thread(target=stderr_reader, daemon=True)
+        stderr_thread.start()
+
+        # Watchdog for output timeout
+        q = queue.Queue(maxsize=1000)
+        def reader():
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                print(f"[GO-OUT] {line}")
+                try:
+                    result = json.loads(line)
+                    q.put(result)
+                except json.JSONDecodeError:
+                    print(f"[WARN] Could not decode JSON: {line}")
+                    continue
+            print("[DEBUG] Go stdout closed.")
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        last_output = time.time()
+        while True:
+            try:
+                result = q.get(timeout=10)
+                last_output = time.time()
+                results.append(result)
+            except queue.Empty:
+                if proc.poll() is not None and q.empty():
+                    print(f"[DEBUG] Go process exited with code {proc.returncode} and output queue is empty.")
+                    break
+                elif proc.poll() is None:
+                    print("[WARN] No JSON output from Go for 10s, but Go is still running...")
+                    continue
+                else:
+                    print(f"[DEBUG] Go process exited with code {proc.returncode} but output queue not empty.")
+                    break
+        proc.stdout.close()
+        proc.wait()
+        print(f"[DEBUG] Go process final exit code: {proc.returncode}")
+        if proc.returncode != 0:
+            print(f"[ERROR] Go crawler failed: return code {proc.returncode}")
+            # Print any remaining stderr
+            try:
+                err = proc.stderr.read()
+                if err:
+                    print(f"[GO-STDERR-FINAL] {err}")
+            except Exception:
+                pass
+            raise RuntimeError(f"Go crawler failed: return code {proc.returncode}")
+        if not results:
+            print("[ERROR] Go crawler produced no output.")
+            raise RuntimeError("Go crawler produced no output.")
+    except Exception as e:
+        print(f"[ERROR] Exception while running Go crawler: {e}")
         raise
-    except subprocess.TimeoutExpired:
-        print(f"[!] Go crawler timed out after 5 minutes")
-        raise
-    finally:
-        # Clean up temporary file
-        if 'temp_input_path' in locals():
-            os.unlink(temp_input_path)
+    print(f"[DEBUG] Parsed {len(results)} results from Go crawler in {time.time() - start_time:.2f}s.")
+    from storage.writer import save_result
+    save_result(results)
+    print(f"[✓] Results saved to output/results.json ({len(results)} entries)")
+    return results
 
 def convert_go_results_to_python_format(go_output: Dict[str, Any]) -> List[Dict[str, Any]]:
     """

@@ -5,8 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 // Fetcher handles HTTP requests with proper timeouts and error handling
@@ -23,6 +27,8 @@ func NewFetcher(timeoutStr string, userAgent string) *Fetcher {
 		timeout = 30 * time.Second
 	}
 
+	jar, _ := cookiejar.New(nil)
+
 	client := &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
@@ -30,6 +36,7 @@ func NewFetcher(timeoutStr string, userAgent string) *Fetcher {
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     30 * time.Second,
 		},
+		Jar: jar,
 	}
 
 	return &Fetcher{
@@ -60,7 +67,7 @@ func (f *Fetcher) FetchPage(ctx context.Context, url string) (*CrawlResult, erro
 	// Add common headers
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	// req.Header.Set("Accept-Encoding", "gzip, deflate") // Let Go handle decompression automatically
 	req.Header.Set("Connection", "keep-alive")
 
 	// Make the request
@@ -97,6 +104,17 @@ func (f *Fetcher) FetchPage(ctx context.Context, url string) (*CrawlResult, erro
 	links := extractLinks(string(body), url)
 	internalLinks, externalLinks := categorizeLinks(links, url)
 
+	// After extracting links
+	if links == nil {
+		links = []string{}
+	}
+	if internalLinks == nil {
+		internalLinks = []string{}
+	}
+	if externalLinks == nil {
+		externalLinks = []string{}
+	}
+
 	return &CrawlResult{
 		URL:           url,
 		Status:        resp.StatusCode,
@@ -107,6 +125,13 @@ func (f *Fetcher) FetchPage(ctx context.Context, url string) (*CrawlResult, erro
 		InternalLinks: internalLinks,
 		ExternalLinks: externalLinks,
 	}, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // extractTitle extracts the page title from HTML content
@@ -127,65 +152,52 @@ func extractTitle(html string) string {
 	return strings.TrimSpace(title)
 }
 
-// extractLinks extracts all links from HTML content
-func extractLinks(html, baseURL string) []string {
+// extractLinks extracts all href, src, and action attributes from any tag in the HTML
+func extractLinks(htmlContent, baseURL string) []string {
 	var links []string
-	seen := make(map[string]bool) // Avoid duplicates
+	seen := make(map[string]bool)
 
-	// Simple link extraction - looks for href attributes
-	// This is a basic implementation; for production, consider using a proper HTML parser
-	startIndex := 0
-	for {
-		// Find the next href attribute
-		hrefIndex := strings.Index(html[startIndex:], "href=\"")
-		if hrefIndex == -1 {
-			break
-		}
-
-		// Adjust to absolute position in the string
-		hrefIndex += startIndex + 6 // Length of "href=\""
-
-		// Find the closing quote
-		quoteEnd := strings.Index(html[hrefIndex:], "\"")
-		if quoteEnd == -1 {
-			break
-		}
-
-		// Extract the link
-		link := html[hrefIndex : hrefIndex+quoteEnd]
-
-		// Process the link
-		if link != "" && !strings.HasPrefix(link, "#") && !strings.HasPrefix(link, "javascript:") {
-			var fullLink string
-
-			// Normalize the link
-			if strings.HasPrefix(link, "http") {
-				fullLink = link
-			} else if strings.HasPrefix(link, "/") {
-				// Relative to domain
-				fullLink = baseURL + link
-			} else {
-				// Skip relative links without leading slash
-				startIndex = hrefIndex + quoteEnd + 1
-				continue
-			}
-
-			// Add to results if not seen before
-			if !seen[fullLink] {
-				links = append(links, fullLink)
-				seen[fullLink] = true
-			}
-		}
-
-		// Move to next position
-		startIndex = hrefIndex + quoteEnd + 1
-
-		// Safety check to prevent infinite loops
-		if startIndex >= len(html) {
-			break
-		}
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		return links
 	}
 
+	var base *url.URL
+	base, _ = url.Parse(baseURL)
+
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			for _, attr := range n.Attr {
+				key := strings.ToLower(attr.Key)
+				if key == "href" || key == "src" || key == "action" {
+					val := strings.TrimSpace(attr.Val)
+					if val == "" || strings.HasPrefix(val, "#") || strings.HasPrefix(strings.ToLower(val), "javascript:") {
+						continue
+					}
+					u, err := url.Parse(val)
+					if err != nil {
+						continue
+					}
+					var abs *url.URL
+					if base != nil {
+						abs = base.ResolveReference(u)
+					} else {
+						abs = u
+					}
+					absStr := abs.String()
+					if !seen[absStr] {
+						links = append(links, absStr)
+						seen[absStr] = true
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+	}
+	f(doc)
 	return links
 }
 
@@ -205,20 +217,15 @@ func categorizeLinks(links []string, baseURL string) (internal, external []strin
 	return internal, external
 }
 
-// extractDomain extracts the domain from a URL
-func extractDomain(url string) string {
-	// Remove protocol
-	if strings.HasPrefix(url, "http://") {
-		url = url[7:]
-	} else if strings.HasPrefix(url, "https://") {
-		url = url[8:]
+// extractDomain extracts the domain from a URL and normalizes by removing 'www.'
+func extractDomain(rawurl string) string {
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return rawurl
 	}
-
-	// Get domain part
-	slashIndex := strings.Index(url, "/")
-	if slashIndex != -1 {
-		url = url[:slashIndex]
+	host := u.Hostname()
+	if strings.HasPrefix(host, "www.") {
+		host = host[4:]
 	}
-
-	return url
+	return host
 }

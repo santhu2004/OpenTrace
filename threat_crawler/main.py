@@ -1,61 +1,61 @@
 # main.py — Entry point for the hybrid Go/Python crawler
-import asyncio
-import os
-import json
-from pathlib import Path
+import sys
+import traceback
+from config import settings
+from core.crawler import run_go_crawler
+from core.tagger import tag_content
+from core.parser import extract_page_info
+from storage.writer import save_result
 
-from core.crawler import crawl_site
-from config.settings import SEED_URL
 
-async def main():
+def main():
     """
-    Main orchestration function that runs the hybrid Go/Python crawler.
+    Main entry point for CR4WL3R Python pipeline.
+    Loads config, runs Go crawler, analyzes, and saves results.
     """
-    print("🚀 Starting CR4WL3R - Hybrid Go/Python Threat Intelligence Crawler")
-    print(f"🎯 Target: {SEED_URL}")
-    print("=" * 60)
-    
-    # Ensure output directory exists
-    os.makedirs("output", exist_ok=True)
-    
-    # Initialize results file
-    results_file = Path("output/results.json")
-    if results_file.exists():
-        results_file.unlink()  # Remove existing file
-    
-    # Start with JSON array
-    with open(results_file, "w", encoding="utf-8") as f:
-        f.write("[\n")
-    
+    # Load config from settings.py
+    config = {
+        'start_url': getattr(settings, 'START_URL', None),
+        'max_depth': getattr(settings, 'MAX_DEPTH', 3),
+        'max_pages': getattr(settings, 'MAX_PAGES', 100),
+        'timeout': getattr(settings, 'TIMEOUT', '30s'),
+        'user_agent': getattr(settings, 'USER_AGENT', 'ThreatCrawler/3.0'),
+        'workers': getattr(settings, 'WORKERS', 10),
+    }
+    print(f"[DEBUG] Using config: {config}")
+
     try:
-        # Run the Go-powered crawler
-        await crawl_site(SEED_URL)
-        
-        # Close the JSON array
-        with open(results_file, "a", encoding="utf-8") as f:
-            f.write("\n]\n")
-        
-        print("=" * 60)
-        print("✅ Crawling completed successfully!")
-        print(f"📁 Results saved to: {results_file}")
-        
-        # Show file size
-        if results_file.exists():
-            size_kb = results_file.stat().st_size / 1024
-            print(f"📊 Results file size: {size_kb:.1f} KB")
-        
+        # Run Go crawler and get results
+        go_results = run_go_crawler(config)
+        print(f"[DEBUG] Go crawler returned {len(go_results)} results.")
     except Exception as e:
-        print(f"❌ Crawling failed: {e}")
-        raise
-    finally:
-        # Ensure JSON array is properly closed even on error
-        if results_file.exists() and results_file.stat().st_size > 0:
-            with open(results_file, "r", encoding="utf-8") as f:
-                content = f.read()
-            
-            if not content.strip().endswith("]"):
-                with open(results_file, "a", encoding="utf-8") as f:
-                    f.write("\n]\n")
+        print(f"[ERROR] Failed to run Go crawler: {e}", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
+
+    if not go_results:
+        print("[WARN] Go crawler returned no results. No output will be saved.")
+
+    processed_results = []
+    for result in go_results:
+        # Optionally analyze with parser/tagger
+        html = result.get('html', '')  # If HTML is included in Go output
+        title, tech_stack = extract_page_info(html) if html else (result.get('title', ''), [])
+        tags = tag_content(html, result.get('headers', {}), tech_stack)
+        result['title'] = title
+        result['tech_stack'] = tech_stack
+        result['tags'] = tags
+        processed_results.append(result)
+
+    # Save results to output/results.json
+    try:
+        print(f"[DEBUG] Saving {len(processed_results)} results to output/results.json")
+        save_result(processed_results)
+        print(f"[✓] Results saved to output/results.json")
+    except Exception as e:
+        print(f"[ERROR] Failed to save results: {e}", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

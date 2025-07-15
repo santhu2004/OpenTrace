@@ -16,10 +16,6 @@
 # ]
 # # config/settings.py
 
-CRAWL_DEPTH_LIMIT = 3
-MAX_PAGES_PER_DOMAIN = 50
-SEED_URL = "https://httpbin.org"  # Regular site (no Tor needed)
-
 # Example .onion sites (uncomment to test Tor functionality):
 # SEED_URL = "http://hqfld5smkr4b4xrjcco7zotvoqhuuoehjdvoin755iytmpk4sm7cbwad.onion/"
 # SEED_URL = "http://2ln3x7ru6psileh7il7jot2ufhol4o7nd54z663xonnnmmku4dgkx3ad.onion"
@@ -30,6 +26,16 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (ThreatIntelBot)"
 }
 
-TIMEOUT = 10  # seconds
+TIMEOUT = '10s'  # Go expects string like '10s'
 # Tor is now automatically enabled for .onion sites
 TOR_PROXY = "socks5://127.0.0.1:9050"
+
+# Standardized config for Go integration
+START_URL = "https://hellofhackers.com"
+MAX_DEPTH = 3
+MAX_PAGES = 30
+TIMEOUT = '10s'  # Go expects string like '10s'
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+WORKERS = 10
+CRAWL_DEPTH_LIMIT = MAX_DEPTH
+MAX_PAGES_PER_DOMAIN = MAX_PAGES
