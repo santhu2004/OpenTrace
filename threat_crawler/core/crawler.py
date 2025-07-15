@@ -62,6 +62,7 @@ def run_go_crawler(config: dict) -> List[Dict[str, Any]]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             bufsize=1,
             cwd=go_dir,
         )
@@ -129,7 +130,8 @@ def run_go_crawler(config: dict) -> List[Dict[str, Any]]:
     print(f"[DEBUG] Parsed {len(results)} results from Go crawler in {time.time() - start_time:.2f}s.")
     from storage.writer import save_result
     save_result(results)
-    print(f"[✓] Results saved to output/results.json ({len(results)} entries)")
+    print(f"[✓] Results saved to output/results.ndjson ({len(results)} entries)")
+    print(f"[INFO] Total links crawled: {len(results)}")
     return results
 
 def convert_go_results_to_python_format(go_output: Dict[str, Any]) -> List[Dict[str, Any]]:

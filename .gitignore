@@ -64,3 +64,9 @@ secrets.json
 *.tmp
 *.temp
 .cache/ 
+
+__pycache__/
+*.pyc
+*.exe
+output/*.ndjson
+output/*.json 

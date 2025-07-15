@@ -224,8 +224,6 @@ func extractDomain(rawurl string) string {
 		return rawurl
 	}
 	host := u.Hostname()
-	if strings.HasPrefix(host, "www.") {
-		host = host[4:]
-	}
+	host = strings.TrimPrefix(host, "www.")
 	return host
 }

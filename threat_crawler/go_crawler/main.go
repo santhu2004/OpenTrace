@@ -93,7 +93,10 @@ func main() {
 	// Output each result as a single JSON object per line
 	encoder := json.NewEncoder(os.Stdout)
 	for result := range resultsCh {
-		activityCh <- struct{}{} // Signal activity
+		select {
+		case activityCh <- struct{}{}:
+		default:
+		}
 		encoder.Encode(result)
 	}
 

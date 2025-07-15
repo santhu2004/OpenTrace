@@ -3,29 +3,28 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var (
-	pagesCrawled int32
-	queueSize    int32
-)
+var ()
 
 // Crawler manages the crawling process with concurrency and depth control
 type Crawler struct {
-	config     *CrawlConfig
-	fetcher    *Fetcher
-	visited    map[string]VisitedPage
-	visitedMux sync.RWMutex
-	results    []*CrawlResult
-	resultsMux sync.Mutex
-	queue      chan Page
-	wg         sync.WaitGroup
-	activeJobs int32
-	startTime  time.Time
+	config       *CrawlConfig
+	fetcher      *Fetcher
+	visited      map[string]VisitedPage
+	visitedMux   sync.RWMutex
+	results      []*CrawlResult
+	resultsMux   sync.Mutex
+	queue        chan Page
+	wg           sync.WaitGroup
+	activeJobs   int32
+	startTime    time.Time
+	resultsCount int32 // atomic counter for results
 }
 
 // NewCrawler creates a new crawler instance
@@ -139,13 +138,10 @@ func (c *Crawler) processPage(ctx context.Context, page Page) {
 		return
 	}
 
-	// Check if we've reached max links
-	c.resultsMux.Lock()
-	if len(c.results) >= c.config.MaxLinks {
-		c.resultsMux.Unlock()
+	// Strict atomic check for max links
+	if atomic.LoadInt32(&c.resultsCount) >= int32(c.config.MaxLinks) {
 		return
 	}
-	c.resultsMux.Unlock()
 
 	// Fetch the page
 	log.Printf("Fetching page: %s", page.URL)
@@ -163,6 +159,12 @@ func (c *Crawler) processPage(ctx context.Context, page Page) {
 
 	// Set depth
 	result.Depth = page.Depth
+
+	// Atomically increment and check if we can add this result
+	if atomic.AddInt32(&c.resultsCount, 1) > int32(c.config.MaxLinks) {
+		// Exceeded limit, do not add this result
+		return
+	}
 
 	// Add to results
 	c.resultsMux.Lock()
@@ -270,28 +272,30 @@ func (c *Crawler) CrawlStream(ctx context.Context, out chan<- *CrawlResult) {
 	queue := make(chan QueueItem, c.config.MaxLinks*2)
 	var wg sync.WaitGroup       // For worker goroutines
 	var inFlight sync.WaitGroup // For in-flight work
+	done := make(chan struct{}) // Signal for forced shutdown
 	var closeOnce sync.Once     // Guard for closing out
 
 	normalize := func(url string) string {
 		return strings.TrimRight(url, "/")
 	}
 
-	// Worker function (with debug logs and defer for inFlight.Done)
+	// Worker function (with defer recover to catch panics)
 	worker := func(id int) {
 		defer func() {
-			log.Printf("[WORKER %d] Exiting", id)
-			wg.Done()
+			if r := recover(); r != nil {
+				log.Printf("[WORKER %d] Panic recovered: %v", id, r)
+			}
 		}()
+		defer wg.Done()
 		for {
 			select {
 			case <-ctx.Done():
 				log.Printf("[WORKER %d] Context cancelled, exiting", id)
 				return
-			case item, ok := <-queue:
-				if !ok {
-					log.Printf("[WORKER %d] Queue closed, exiting", id)
-					return
-				}
+			case <-done:
+				log.Printf("[WORKER %d] Forced shutdown, exiting", id)
+				return
+			case item := <-queue:
 				func() {
 					defer inFlight.Done() // Always call Done for this item
 
@@ -320,9 +324,21 @@ func (c *Crawler) CrawlStream(ctx context.Context, out chan<- *CrawlResult) {
 							result.Headers = map[string]string{}
 						}
 						result.Headers["Parent-URL"] = item.Parent
-						out <- result
+						// Atomically increment resultsCount. If it exceeds maxLinks, return immediately.
+						count := atomic.AddInt32(&c.resultsCount, 1)
+						if count > int32(c.config.MaxLinks) {
+							return
+						}
+						// When sending to out, always guard with select
+						select {
+						case <-ctx.Done():
+							return
+						case <-done:
+							return
+						case out <- result:
+						}
 						// Enqueue discovered links
-						if item.Depth < c.config.MaxDepth {
+						if atomic.LoadInt32(&c.resultsCount) < int32(c.config.MaxLinks) && item.Depth < c.config.MaxDepth {
 							for _, link := range result.Links {
 								visitedMux.RLock()
 								_, already := visited[normalize(link)]
@@ -330,7 +346,16 @@ func (c *Crawler) CrawlStream(ctx context.Context, out chan<- *CrawlResult) {
 								if !already {
 									log.Printf("[WORKER %d] Enqueueing: %s (depth: %d)", id, link, item.Depth+1)
 									inFlight.Add(1)
-									queue <- QueueItem{URL: link, Depth: item.Depth + 1, Parent: item.URL}
+									select {
+									case queue <- QueueItem{URL: link, Depth: item.Depth + 1, Parent: item.URL}:
+										// enqueued
+									case <-ctx.Done():
+										inFlight.Done() // undo the Add, since we won't process this link
+										return
+									case <-done:
+										inFlight.Done() // undo the Add, since we won't process this link
+										return
+									}
 								}
 							}
 						}
@@ -350,33 +375,58 @@ func (c *Crawler) CrawlStream(ctx context.Context, out chan<- *CrawlResult) {
 		go worker(i)
 	}
 
-	// Monitor in-flight work and close queue/results when done
+	// Monitor goroutine: closes out only after all work is done
 	go func() {
-		log.Println("[MONITOR] Waiting for inFlight to finish...")
-		done := make(chan struct{})
+		wg.Wait() // Wait for all workers to exit
+		log.Printf("[MONITOR] All workers exited. Draining queue...")
+		// Drain any remaining items in the queue and mark them done
+		queueDrained := 0
+		for {
+			select {
+			case <-ctx.Done():
+				for {
+					select {
+					case <-queue:
+						inFlight.Done()
+						queueDrained++
+					default:
+						goto drained
+					}
+				}
+			drained:
+				break
+			default:
+				break
+			}
+			break
+		}
+		log.Printf("[MONITOR] Queue drained. Items drained: %d", queueDrained)
+		// Log inFlight count before waiting
+		log.Printf("[MONITOR] inFlight before Wait: (should be 0) ...")
+		// Start a hard shutdown timer
+		doneCh := make(chan struct{})
 		go func() {
 			inFlight.Wait()
-			log.Println("[MONITOR] inFlight done, closing queue...")
-			close(queue)
-			log.Println("[MONITOR] Waiting for all workers to exit...")
-			wg.Wait()
-			log.Println("[MONITOR] All workers exited, closing output channel...")
-			closeOnce.Do(func() { close(out) })
-			log.Println("[MONITOR] Output channel closed. CrawlStream done.")
-			close(done)
+			close(doneCh)
 		}()
 		select {
-		case <-done:
-			// Normal exit
+		case <-doneCh:
+			log.Printf("[MONITOR] inFlight.Wait() returned. Proceeding to close output.")
+		case <-time.After(10 * time.Second):
+			log.Printf("[MONITOR] FATAL: inFlight.Wait() did not return after 10s. Forcing exit.")
+			os.Exit(2)
+		}
+		closeOnce.Do(func() {
+			close(out)
+		})
+	}()
+
+	// Forced shutdown monitor
+	go func() {
+		select {
 		case <-ctx.Done():
-			log.Println("[MONITOR] Context cancelled, waiting up to 10s for shutdown...")
-			select {
-			case <-done:
-				// Shutdown completed in time
-			case <-time.After(10 * time.Second):
-				log.Println("[MONITOR] Timeout waiting for shutdown. Forcing output channel close!")
-				closeOnce.Do(func() { close(out) })
-			}
+			log.Println("[MONITOR] Context cancelled, forcing shutdown...")
+			close(done)
 		}
 	}()
 }
