@@ -1,15 +1,11 @@
 # core/crawler.py
 
-import asyncio
 import json
 import subprocess
-import tempfile
 import os
-import sys
-from pathlib import Path
 from typing import Dict, List, Any
 from storage.writer import save_result
-from config.settings import CRAWL_DEPTH_LIMIT, MAX_PAGES_PER_DOMAIN
+from config.settings import CRAWL_DEPTH_LIMIT, MAX_PAGES_PER_DOMAIN, TIMEOUT, USER_AGENT, WORKERS
 
 
 def run_go_crawler(config: dict) -> List[Dict[str, Any]]:
@@ -26,7 +22,6 @@ def run_go_crawler(config: dict) -> List[Dict[str, Any]]:
     import time
     import threading
     import queue
-    import os
     import json
 
     go_bin = os.path.join(os.path.dirname(__file__), '../go_crawler/fastcrawl.exe')
@@ -128,24 +123,21 @@ def run_go_crawler(config: dict) -> List[Dict[str, Any]]:
         print(f"[ERROR] Exception while running Go crawler: {e}")
         raise
     print(f"[DEBUG] Parsed {len(results)} results from Go crawler in {time.time() - start_time:.2f}s.")
-    from storage.writer import save_result
     save_result(results)
     print(f"[✓] Results saved to output/results.ndjson ({len(results)} entries)")
     print(f"[INFO] Total links crawled: {len(results)}")
     return results
 
+# Note: If using NDJSON, adapt this function to accept a list of dicts instead of a dict with 'results' key.
 def convert_go_results_to_python_format(go_output: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Convert Go crawler results to Python pipeline format.
-    
     Args:
         go_output: Raw output from Go crawler
-        
     Returns:
         List of page results in Python format
     """
     python_results = []
-    
     for result in go_output['results']:
         # Convert Go result to Python format
         python_result = {
@@ -159,13 +151,10 @@ def convert_go_results_to_python_format(go_output: Dict[str, Any]) -> List[Dict[
             "depth": result['depth'],
             "discovered": result['discovered']
         }
-        
         # Add error if present
         if 'error' in result and result['error']:
             python_result['error'] = result['error']
-        
         python_results.append(python_result)
-    
     return python_results
 
 async def crawl_site(seed_url):
@@ -174,31 +163,30 @@ async def crawl_site(seed_url):
     Now uses Go crawler for high-performance crawling.
     """
     print(f"[+] Starting Go-powered crawl for: {seed_url}")
-    
     try:
+        # Build config dict for Go crawler
+        go_config = {
+            "start_url": seed_url,
+            "max_depth": CRAWL_DEPTH_LIMIT,
+            "max_pages": MAX_PAGES_PER_DOMAIN,
+            "timeout": TIMEOUT,
+            "user_agent": USER_AGENT,
+            "workers": WORKERS
+        }
         # Use Go crawler for high-performance crawling
-        go_results = run_go_crawler(
-            target_url=seed_url,
-            max_depth=CRAWL_DEPTH_LIMIT,
-            max_links=MAX_PAGES_PER_DOMAIN
-        )
-        
+        go_results = run_go_crawler(go_config)
         # Convert to Python format
         pages = convert_go_results_to_python_format(go_results)
-        
         print(f"[+] Processing {len(pages)} crawled pages with Python threat intelligence...")
-        
         # Process each page with Python threat intelligence modules
         for page in pages:
             if page['status_code'] != 200:
                 print(f"[!] Skipping failed page: {page['url']} (status: {page['status_code']})")
                 continue
-
             # For now, we'll use the data from Go crawler
             # In a full implementation, you might want to re-fetch with Python
             # to get HTML for detailed analysis
             print(f"[+] Processing: {page['url']}")
-            
             # Create a basic result structure compatible with existing pipeline
             result_data = {
                 "url": page['url'],
@@ -215,15 +203,14 @@ async def crawl_site(seed_url):
                 "tech_stack": [],   # Will be filled by parser
                 "tags": []          # Will be filled by tagger
             }
-            
             # Save the result
             await save_result(result_data)
-        
         print(f"[✓] Completed Go-powered crawl for {seed_url}")
-        print(f"[*] Summary: {go_results['summary']['total_pages']} pages, "
-              f"{go_results['summary']['successful']} successful, "
-              f"{go_results['summary']['failed']} failed")
-        
+        # If go_results is a dict with 'summary', print summary
+        if isinstance(go_results, dict) and 'summary' in go_results:
+            print(f"[*] Summary: {go_results['summary']['total_pages']} pages, "
+                  f"{go_results['summary']['successful']} successful, "
+                  f"{go_results['summary']['failed']} failed")
     except Exception as e:
         print(f"[!] Go crawler integration failed: {e}")
         raise

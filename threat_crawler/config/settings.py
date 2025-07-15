@@ -33,7 +33,7 @@ TOR_PROXY = "socks5://127.0.0.1:9050"
 # Standardized config for Go integration
 START_URL = "https://hellofhackers.com"
 MAX_DEPTH = 3
-MAX_PAGES = 8000 #make it 8k later
+MAX_PAGES = 400 #make it 8k later
 TIMEOUT = '10s'  # Go expects string like '10s'
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 WORKERS = 10
