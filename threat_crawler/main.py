@@ -57,5 +57,19 @@ def main():
         traceback.print_exc()
         sys.exit(1)
 
+    # --- Tagging pipeline integration ---
+    import json
+    from core.tagger import tag_ndjson_records
+    from storage.writer import save_tagged_result
+    # Save to output/tagged.ndjson after tagging
+    try:
+        print(f"[DEBUG] Tagging {len(processed_results)} results and saving to output/tagged.ndjson")
+        tagged_results = tag_ndjson_records(processed_results)
+        save_tagged_result(tagged_results)
+    except Exception as e:
+        print(f"[ERROR] Failed during tagging pipeline: {e}", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
+
 if __name__ == "__main__":
     main()

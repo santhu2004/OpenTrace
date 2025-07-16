@@ -1,0 +1,41 @@
+# Blocklist for crawler/tagger: ignore these URL patterns and file types
+# Add or adjust as needed for your use case
+patterns:
+  # Static assets (file extensions)
+  - ".*\\.(css|js|svg|woff2?|ttf|eot|ico|jpg|jpeg|png|gif|bmp|webp|avif|mp4|webm|ogg|mp3|wav|m4a|flac|zip|rar|tar|gz|7z|pdf|docx?|xlsx?|pptx?)$"
+
+  # Analytics/tracking paths
+  - "/analytics"
+  - "/gtag"
+  - "/track"
+  - "/pixel"
+  - "/stats"
+  - "/stat"
+  - "/collect"
+  - "/event"
+  - "/matomo"
+  - "/plausible"
+  - "/segment"
+  - "/amplitude"
+  - "/mixpanel"
+  - "/sentry"
+  - "/newrelic"
+  - "/datadog"
+
+  # Social media/share endpoints
+  - "/share"
+  - "/sharer"
+  - "/facebook.com/sharer"
+  - "/twitter.com/share"
+  - "/linkedin.com/share"
+  - "/pinterest.com/pin/create"
+  - "/reddit.com/submit"
+  - "/addthis.com"
+  - "/addtoany.com"
+
+  # Other common non-informative endpoints
+  - "/favicon\\.ico$"
+  - "/robots\\.txt$"
+  - "/sitemap\\.xml$"
+  - "/manifest\\.json$"
+  - "/apple-touch-icon" 

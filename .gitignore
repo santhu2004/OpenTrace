@@ -70,3 +70,6 @@ __pycache__/
 *.exe
 output/*.ndjson
 output/*.json 
+
+# Ignore test directory
+threat_crawler/tests/ 
